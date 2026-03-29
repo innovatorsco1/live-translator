@@ -44,8 +44,48 @@ export interface TranslationMessage {
 export type WSMessage =
   | { type: 'transcript'; payload: TranslationMessage }
   | { type: 'translation'; payload: TranslationMessage }
+  | { type: 'translation_chunk'; payload: TranslationChunk }
+  | { type: 'translate_request'; payload: TranslateRequest }
   | { type: 'control'; payload: ControlCommand }
   | { type: 'status'; payload: StatusUpdate };
+
+// ---------------------------------------------------------------------------
+// Streaming translation chunk (server → display)
+// ---------------------------------------------------------------------------
+
+/**
+ * Incremental chunk of a translation in progress.
+ * The display can render partial text as it arrives for lower perceived latency.
+ */
+export interface TranslationChunk {
+  /** Matches the `id` of the originating TranslationMessage. */
+  id: string;
+  /** The new token(s) received in this chunk. */
+  chunk: string;
+  /** All translated text accumulated so far. */
+  accumulated: string;
+  /** Original English text being translated. */
+  originalText: string;
+  /** `true` when this is the final chunk (stream complete). */
+  done: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Translation request (control → server via WS)
+// ---------------------------------------------------------------------------
+
+/**
+ * Sent by the control panel to request server-side translation.
+ * Eliminates the HTTP round-trip through /api/translate.
+ */
+export interface TranslateRequest {
+  /** Unique ID for this translation segment. */
+  id: string;
+  /** Raw English text to translate. */
+  text: string;
+  /** Unix epoch ms. */
+  timestamp: number;
+}
 
 // ---------------------------------------------------------------------------
 // Control commands (client → server)

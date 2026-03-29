@@ -306,36 +306,16 @@ export default function DisplayPage(): React.JSX.Element {
   }, []);
 
   // ---- WebSocket connection ------------------------------------------------
-  // When wsUrl is still '' (first render, pre-hydration) we pass a placeholder
-  // that the hook will attempt to connect to but will simply fail gracefully.
-  const { messages, isConnected, sendMessage: _sendMessage } = useWebSocket(
+  const { messages, isConnected, remoteSettings } = useWebSocket(
     wsUrl !== '' ? wsUrl : 'ws://localhost:3001',
   );
 
-  // Watch for 'control' + 'settings' messages to update settings at runtime.
-  // The hook exposes the raw messages array; we process the latest one on
-  // each render cycle using a ref to avoid duplicate processing.
-  const lastProcessedIndexRef = useRef(-1);
+  // Apply remote settings pushed by the control panel.
   useEffect(() => {
-    // Scan any newly arrived messages for settings commands.
-    // We iterate from the last processed index onwards.
-    const start = lastProcessedIndexRef.current + 1;
-    if (start >= messages.length) return;
-
-    for (let i = start; i < messages.length; i++) {
-      // messages is TranslationMessage[], control messages are handled
-      // inside the hook (clear) or we handle settings overrides here.
-      // Note: the hook's messages array only contains TranslationMessage items.
-      // Control + settings flow comes through the WSMessage union but the hook
-      // exposes only TranslationMessage in the messages array.
-      // DisplaySettings overrides via WS are therefore applied through the
-      // hook's internal control handler which clears messages on 'clear'.
-      // For 'settings' action support, the hook would need to expose it.
-      // We keep this loop as an extension point for future per-message work.
+    if (remoteSettings) {
+      setSettings((prev) => ({ ...prev, ...remoteSettings }));
     }
-
-    lastProcessedIndexRef.current = messages.length - 1;
-  }, [messages]);
+  }, [remoteSettings]);
 
   // ---- Derive display lines -----------------------------------------------
   const displayLines = useMemo(

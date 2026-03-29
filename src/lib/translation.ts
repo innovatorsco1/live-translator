@@ -1,21 +1,23 @@
 /**
- * Translation service backed by OpenAI GPT-4.
+ * Translation service backed by OpenAI.
+ *
+ * Optimisations (vs. the original implementation):
+ *  - Model: gpt-4o-mini instead of gpt-4 (~5x faster, sufficient for translation)
+ *  - Streaming: `translateTextStream` yields tokens as they arrive
+ *  - Caching: LRU cache avoids re-translating repeated / common phrases
+ *  - Compact prompt: shorter system prompt → fewer input tokens → lower latency
  *
  * This module is server-only (used inside Next.js API routes and the WebSocket
  * handler). It must never be imported from client components.
  */
 
 import OpenAI from 'openai';
+import { translationCache } from './translation-cache';
 
 // ---------------------------------------------------------------------------
 // Client singleton
 // ---------------------------------------------------------------------------
 
-/**
- * Lazily-initialised OpenAI client.  We defer construction until the first
- * call so that the module can be imported in environments where the API key
- * may not yet be present (e.g. during type-checking).
- */
 let _client: OpenAI | null = null;
 
 function getClient(): OpenAI {
@@ -33,52 +35,53 @@ function getClient(): OpenAI {
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Model configuration
+// ---------------------------------------------------------------------------
+
+/** Fast model for translation – gpt-4o-mini is ~5x faster than gpt-4. */
+const TRANSLATION_MODEL = process.env.TRANSLATION_MODEL || 'gpt-4o-mini';
+
+// ---------------------------------------------------------------------------
+// Prompt builder
+// ---------------------------------------------------------------------------
+
+function buildSystemPrompt(sourceLang: string, targetLang: string): string {
+  return (
+    `Translate ${sourceLang} to ${targetLang}. Output ONLY the translation.`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Public API: batch translation (with cache)
 // ---------------------------------------------------------------------------
 
 /**
- * Translate `text` from `sourceLang` to `targetLang` using GPT-4.
- *
- * @param text       - The text to translate.
- * @param sourceLang - BCP-47 language tag or plain name of the source language.
- *                     Defaults to `"English"`.
- * @param targetLang - BCP-47 language tag or plain name of the target language.
- *                     Defaults to `"Spanish"`.
- * @returns The translated string, or the original `text` when translation fails.
- *
- * @example
- * ```ts
- * const spanish = await translateText('Good morning, everyone.');
- * // => 'Buenos días a todos.'
- * ```
+ * Translate `text` from `sourceLang` to `targetLang`.
+ * Returns a cached result when available.
  */
 export async function translateText(
   text: string,
   sourceLang: string = 'English',
   targetLang: string = 'Spanish',
 ): Promise<string> {
-  // Short-circuit empty or whitespace-only input to avoid wasting API credits.
   const trimmed = text.trim();
-  if (trimmed.length === 0) {
-    return text;
+  if (trimmed.length === 0) return text;
+
+  // Cache lookup
+  const cached = translationCache.get(trimmed);
+  if (cached) {
+    return cached;
   }
 
   try {
     const client = getClient();
 
-    const systemPrompt =
-      `You are a professional real-time translator. ` +
-      `Translate the following text from ${sourceLang} to ${targetLang}. ` +
-      `Only output the translation, nothing else. ` +
-      `Maintain the tone and meaning.`;
-
     const completion = await client.chat.completions.create({
-      model: 'gpt-4',
+      model: TRANSLATION_MODEL,
       messages: [
-        { role: 'system', content: systemPrompt },
+        { role: 'system', content: buildSystemPrompt(sourceLang, targetLang) },
         { role: 'user', content: trimmed },
       ],
-      // Keep latency low for real-time use: single translation sentence is short.
       max_tokens: 512,
       temperature: 0.2,
     });
@@ -86,16 +89,94 @@ export async function translateText(
     const translated = completion.choices[0]?.message?.content?.trim();
 
     if (!translated) {
-      console.warn('[translation] GPT-4 returned an empty response for input:', trimmed);
+      console.warn('[translation] Empty response for:', trimmed);
       return text;
     }
 
+    // Populate cache
+    translationCache.set(trimmed, translated);
+
     return translated;
   } catch (error) {
-    // Log the error server-side so operators can investigate without exposing
-    // raw error details to the client.
     console.error('[translation] OpenAI API error:', error);
-    // Graceful degradation: return original text so captions keep flowing.
+    return text;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public API: streaming translation
+// ---------------------------------------------------------------------------
+
+/**
+ * Callback invoked for each streamed token chunk.
+ *
+ * @param chunk  - The new token(s) received from the model.
+ * @param accumulated - All text received so far (concatenation of all chunks).
+ */
+export type StreamChunkCallback = (chunk: string, accumulated: string) => void;
+
+/**
+ * Translate `text` using the OpenAI streaming API.
+ *
+ * Calls `onChunk` for every incremental token and returns the full
+ * translated string once the stream completes.
+ *
+ * If the text is found in the cache, `onChunk` is called once with the
+ * full cached translation and the function resolves immediately.
+ */
+export async function translateTextStream(
+  text: string,
+  onChunk: StreamChunkCallback,
+  sourceLang: string = 'English',
+  targetLang: string = 'Spanish',
+): Promise<string> {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) {
+    onChunk(text, text);
+    return text;
+  }
+
+  // Cache hit → instant result
+  const cached = translationCache.get(trimmed);
+  if (cached) {
+    onChunk(cached, cached);
+    return cached;
+  }
+
+  try {
+    const client = getClient();
+
+    const stream = await client.chat.completions.create({
+      model: TRANSLATION_MODEL,
+      messages: [
+        { role: 'system', content: buildSystemPrompt(sourceLang, targetLang) },
+        { role: 'user', content: trimmed },
+      ],
+      max_tokens: 512,
+      temperature: 0.2,
+      stream: true,
+    });
+
+    let accumulated = '';
+
+    for await (const event of stream) {
+      const delta = event.choices[0]?.delta?.content;
+      if (delta) {
+        accumulated += delta;
+        onChunk(delta, accumulated);
+      }
+    }
+
+    const result = accumulated.trim() || text;
+
+    // Populate cache
+    translationCache.set(trimmed, result);
+
+    return result;
+  } catch (error) {
+    console.error('[translation] Streaming error:', error);
+    // Fallback: return original text
+    onChunk(text, text);
     return text;
   }
 }

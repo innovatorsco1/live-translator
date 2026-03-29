@@ -4,25 +4,34 @@
  * Runs on a dedicated port (default: 3001) so that the WebSocket traffic is
  * separated from the Next.js HTTP server (port 3000).
  *
- * Message routing:
+ * Optimised message routing:
+ *   - 'translate_request'
+ *       Server-side streaming translation.  The control panel sends raw text;
+ *       the server translates via OpenAI streaming and pushes
+ *       'translation_chunk' messages to all display clients as tokens arrive,
+ *       followed by a final 'translation' message.
+ *       This eliminates the HTTP round-trip through /api/translate.
+ *
  *   - 'translation' / 'transcript' / 'status'
  *       Broadcast to every OTHER connected client (relay model).
- *   - 'control' { action: 'clear' }
- *       Broadcast the clear command to all clients including the sender so
- *       that the control panel UI also resets its local buffer.
- *   - 'control' { action: 'settings' }
- *       Broadcast the updated DisplaySettings to all connected clients so
- *       that every display view picks up the change immediately.
- *   - 'control' { action: 'start' | 'stop' }
- *       Relay to all other clients so the display knows the pipeline state.
  *
- * Exports:
- *   startWSServer()   – idempotent; safe to call multiple times.
- *   broadcastToAll()  – utility used by other server-side modules (e.g. STT).
+ *   - 'control' { action: 'clear' }
+ *       Broadcast the clear command to all clients.
+ *   - 'control' { action: 'settings' }
+ *       Broadcast the updated DisplaySettings to all connected clients.
+ *   - 'control' { action: 'start' | 'stop' }
+ *       Relay to all other clients.
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
-import type { WSMessage, ControlCommand } from '@/types';
+import type {
+  WSMessage,
+  ControlCommand,
+  TranslateRequest,
+  TranslationMessage,
+  TranslationChunk,
+} from '@/types';
+import { translateTextStream } from './translation';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -54,7 +63,6 @@ export function startWSServer(): WebSocketServer {
   wss.on('connection', (ws: WebSocket) => {
     console.log('[ws-server] Client connected');
 
-    // Immediately tell the new client what the current server state is.
     safeSend(ws, {
       type: 'status',
       payload: { isListening: false, isConnected: true },
@@ -77,7 +85,6 @@ export function startWSServer(): WebSocketServer {
     });
 
     ws.on('error', (err: Error) => {
-      // Log socket-level errors without crashing the server process.
       console.error('[ws-server] Socket error:', err.message);
     });
   });
@@ -91,8 +98,6 @@ export function startWSServer(): WebSocketServer {
 
 /**
  * Broadcast a message to ALL connected clients.
- * Intended for use by other server-side modules (e.g. a future STT pipeline)
- * that need to push messages without an originating WebSocket client.
  */
 export function broadcastToAll(message: WSMessage): void {
   if (!wss) return;
@@ -108,18 +113,22 @@ export function broadcastToAll(message: WSMessage): void {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Route an incoming message to the appropriate broadcast strategy.
- *
- * @param message - Parsed WSMessage received from a client.
- * @param sender  - The originating WebSocket connection.
- */
 function handleMessage(message: WSMessage, sender: WebSocket): void {
   switch (message.type) {
+    case 'translate_request': {
+      // Server-side streaming translation – the big latency win.
+      handleTranslateRequest(message.payload, sender);
+      break;
+    }
+
     case 'translation':
     case 'transcript': {
-      // Relay to every other connected client (the sender already has the data).
       broadcastExcluding(message, sender);
+      break;
+    }
+
+    case 'translation_chunk': {
+      // Chunks originate from the server, not clients. Ignore if received.
       break;
     }
 
@@ -127,21 +136,15 @@ function handleMessage(message: WSMessage, sender: WebSocket): void {
       const command = message.payload as ControlCommand;
       switch (command.action) {
         case 'clear':
-          // All clients (including the sender) must flush their display buffer.
           broadcastToAll(message);
           break;
-
         case 'settings':
-          // Push updated display settings to every connected client.
           broadcastToAll(message);
           break;
-
         case 'start':
         case 'stop':
-          // Let all other clients know the pipeline state changed.
           broadcastExcluding(message, sender);
           break;
-
         default:
           console.warn('[ws-server] Unknown control action:', (command as ControlCommand).action);
       }
@@ -149,23 +152,103 @@ function handleMessage(message: WSMessage, sender: WebSocket): void {
     }
 
     case 'status': {
-      // Status frames originate from the server; clients should not send them.
-      // Log and discard rather than relaying to avoid loops.
       console.warn('[ws-server] Received unexpected status frame from client – ignoring');
       break;
     }
 
     default: {
-      // Narrowing exhaustion guard: log unknown message types rather than
-      // silently dropping them so they surface during development.
       console.warn('[ws-server] Unknown message type received:', (message as { type: string }).type);
     }
   }
 }
 
 /**
- * Send a message to every OPEN client except the one supplied in `exclude`.
+ * Handle a translate_request: run streaming translation server-side and push
+ * chunks + final result to all clients (including the sender so it can update
+ * its history).
  */
+async function handleTranslateRequest(
+  req: TranslateRequest,
+  sender: WebSocket,
+): Promise<void> {
+  const { id, text, timestamp } = req;
+
+  // Immediately broadcast the transcript (original text) so the display
+  // can show it while translation is in progress.
+  const transcriptMsg: WSMessage = {
+    type: 'transcript',
+    payload: {
+      id,
+      originalText: text,
+      translatedText: '…',
+      timestamp,
+      isFinal: false,
+    },
+  };
+  broadcastToAll(transcriptMsg);
+
+  try {
+    const fullTranslation = await translateTextStream(
+      text,
+      (chunk: string, accumulated: string) => {
+        // Stream each chunk to all clients.
+        const chunkMsg: WSMessage = {
+          type: 'translation_chunk',
+          payload: {
+            id,
+            chunk,
+            accumulated,
+            originalText: text,
+            done: false,
+          } satisfies TranslationChunk,
+        };
+        broadcastToAll(chunkMsg);
+      },
+    );
+
+    // Send the final complete translation.
+    const finalMsg: WSMessage = {
+      type: 'translation',
+      payload: {
+        id,
+        originalText: text,
+        translatedText: fullTranslation,
+        timestamp,
+        isFinal: true,
+      } satisfies TranslationMessage,
+    };
+    broadcastToAll(finalMsg);
+
+    // Send a done chunk so displays know streaming is complete for this id.
+    const doneChunk: WSMessage = {
+      type: 'translation_chunk',
+      payload: {
+        id,
+        chunk: '',
+        accumulated: fullTranslation,
+        originalText: text,
+        done: true,
+      } satisfies TranslationChunk,
+    };
+    broadcastToAll(doneChunk);
+  } catch (error) {
+    console.error('[ws-server] Translation error for segment', id, error);
+
+    // Send a failed translation so the UI doesn't hang.
+    const errorMsg: WSMessage = {
+      type: 'translation',
+      payload: {
+        id,
+        originalText: text,
+        translatedText: '[Translation failed]',
+        timestamp,
+        isFinal: true,
+      },
+    };
+    broadcastToAll(errorMsg);
+  }
+}
+
 function broadcastExcluding(message: WSMessage, exclude: WebSocket): void {
   if (!wss) return;
   const payload = JSON.stringify(message);
@@ -176,10 +259,6 @@ function broadcastExcluding(message: WSMessage, exclude: WebSocket): void {
   });
 }
 
-/**
- * Serialise and send a message to a single client, swallowing any send
- * errors so one bad socket does not affect the others.
- */
 function safeSend(ws: WebSocket, message: WSMessage): void {
   try {
     if (ws.readyState === WebSocket.OPEN) {

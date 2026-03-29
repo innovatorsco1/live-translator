@@ -3,19 +3,18 @@
 /**
  * Control Panel – Operator Interface
  *
- * This page is used by the event operator to:
- *  1. Start / stop speech recognition (microphone capture).
- *  2. Monitor live transcription (final and interim results).
- *  3. View the last 10 translated segments.
- *  4. Adjust display settings pushed to the audience view via WebSocket.
- *  5. Clear the audience display on demand.
- *
- * Data flow
- * ---------
+ * Data flow (OPTIMISED):
  *  Browser microphone
- *    → useSpeechRecognition (Web Speech API)
- *    → POST /api/translate  (server-side GPT-4 translation)
- *    → useWebSocket.sendMessage (broadcast TranslationMessage to display)
+ *    -> useSpeechRecognition (Web Speech API)
+ *    -> WebSocket 'translate_request' (server-side streaming translation)
+ *    -> Server streams 'translation_chunk' -> 'translation' to all clients
+ *
+ * Key latency improvements vs. original:
+ *  - Eliminated HTTP roundtrip (POST /api/translate)
+ *  - Server translates and broadcasts directly
+ *  - Streaming chunks show partial translations in real-time
+ *  - gpt-4o-mini model (~5x faster than gpt-4)
+ *  - LRU cache avoids re-translating repeated phrases
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
@@ -59,10 +58,9 @@ function formatTimestamp(ms: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Sub-components (inline to keep the operator page self-contained)
+// Sub-components
 // ---------------------------------------------------------------------------
 
-// ------ Pulsing recording dot ------
 function RecordingDot() {
   return (
     <span
@@ -80,7 +78,6 @@ function RecordingDot() {
   );
 }
 
-// ------ Section card wrapper ------
 interface CardProps {
   title: string;
   children: React.ReactNode;
@@ -132,7 +129,6 @@ export default function ControlPage() {
   const [isTranslating, setIsTranslating] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
 
-  // Build WebSocket URL and detect Speech API support once in the browser.
   const [isSpeechSupported, setIsSpeechSupported] = useState(true);
   useEffect(() => {
     if (typeof window !== 'undefined') {
@@ -145,7 +141,7 @@ export default function ControlPage() {
     }
   }, []);
 
-  const { isConnected, sendMessage } = useWebSocket(
+  const { isConnected, messages, sendMessage } = useWebSocket(
     wsUrl || 'ws://localhost:3001',
   );
 
@@ -159,20 +155,56 @@ export default function ControlPage() {
     stopListening,
   } = useSpeechRecognition();
 
-  // Surface microphone errors in the error banner.
   useEffect(() => {
     if (speechError) {
       setLastError(`Microphone error: ${speechError}`);
     }
   }, [speechError]);
 
+  // Track active translation IDs to show translating state
+  const activeTranslationsRef = useRef(new Set<string>());
+
   /**
-   * Translate a finalised speech segment and broadcast it over WebSocket.
-   * Extracted into a stable ref-callback so the transcript-watch effect
-   * below does not need `sendMessage` in its dependency array.
+   * Update local history from WS messages (including streaming chunks).
+   * The server broadcasts translation/translation_chunk/transcript to all
+   * clients including the sender.
+   */
+  useEffect(() => {
+    if (messages.length === 0) return;
+
+    setTranslationHistory((prev) => {
+      const byId = new Map(prev.map((m) => [m.id, m]));
+      let changed = false;
+
+      for (const msg of messages) {
+        const existing = byId.get(msg.id);
+        if (!existing || existing.translatedText !== msg.translatedText || existing.isFinal !== msg.isFinal) {
+          byId.set(msg.id, msg);
+          changed = true;
+        }
+      }
+
+      if (!changed) return prev;
+
+      // Sort by timestamp descending (newest first) for the history view.
+      const sorted = Array.from(byId.values())
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, MAX_HISTORY_ITEMS);
+
+      // Update translating state
+      const hasInFlight = sorted.some((m) => !m.isFinal);
+      setIsTranslating(hasInFlight);
+
+      return sorted;
+    });
+  }, [messages]);
+
+  /**
+   * Send a translate_request to the WS server instead of making an HTTP call.
+   * The server handles translation and broadcasts results.
    */
   const translateAndBroadcast = useCallback(
-    async (segment: string) => {
+    (segment: string) => {
       if (!segment.trim()) return;
 
       setIsTranslating(true);
@@ -181,8 +213,7 @@ export default function ControlPage() {
       const id = generateId();
       const timestamp = Date.now();
 
-      // Optimistically add an in-progress entry so the operator can see
-      // the original text immediately while the translation is pending.
+      // Add to local history immediately with pending state
       const pending: TranslationMessage = {
         id,
         originalText: segment,
@@ -190,105 +221,44 @@ export default function ControlPage() {
         timestamp,
         isFinal: false,
       };
-
       setTranslationHistory((prev) =>
         [pending, ...prev].slice(0, MAX_HISTORY_ITEMS),
       );
 
-      // Broadcast the interim transcript so the display can show it.
-      const transcriptMsg: WSMessage = {
-        type: 'transcript',
-        payload: pending,
+      activeTranslationsRef.current.add(id);
+
+      // Send translate_request to server (no HTTP roundtrip!)
+      const msg: WSMessage = {
+        type: 'translate_request',
+        payload: { id, text: segment, timestamp },
       };
-      sendMessage(transcriptMsg);
-
-      try {
-        const response = await fetch('/api/translate', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            text: segment,
-            sourceLang: 'en',
-            targetLang: 'es',
-          }),
-        });
-
-        if (!response.ok) {
-          throw new Error(`Translation API returned ${response.status}`);
-        }
-
-        const data = (await response.json()) as { translatedText: string };
-        const translated = data.translatedText;
-
-        const finalMessage: TranslationMessage = {
-          id,
-          originalText: segment,
-          translatedText: translated,
-          timestamp,
-          isFinal: true,
-        };
-
-        // Replace the pending item in history.
-        setTranslationHistory((prev) =>
-          prev.map((item) => (item.id === id ? finalMessage : item)),
-        );
-
-        // Broadcast finalised translation to the display.
-        const translationMsg: WSMessage = {
-          type: 'translation',
-          payload: finalMessage,
-        };
-        sendMessage(translationMsg);
-      } catch (err) {
-        const message =
-          err instanceof Error ? err.message : 'Unknown translation error';
-        console.error('[control] Translation failed:', message);
-        setLastError(message);
-
-        // Mark the pending item as errored so the operator can see it.
-        setTranslationHistory((prev) =>
-          prev.map((item) =>
-            item.id === id
-              ? { ...item, translatedText: '[Translation failed]', isFinal: true }
-              : item,
-          ),
-        );
-      } finally {
-        setIsTranslating(false);
-      }
+      sendMessage(msg);
     },
     [sendMessage],
   );
 
   /**
    * Watch `transcript` for new committed text.
-   *
-   * The hook accumulates ALL final text into `transcript` (space-separated).
-   * We track what we have already processed via `prevTranscriptRef` and fire
-   * a translation for each new segment appended since the last render.
    */
   const prevTranscriptRef = useRef('');
   useEffect(() => {
     const prev = prevTranscriptRef.current;
     if (transcript && transcript !== prev) {
-      // Extract only the newly appended portion.
       const newSegment = prev
         ? transcript.slice(prev.length).trimStart()
         : transcript;
       prevTranscriptRef.current = transcript;
 
       if (newSegment.trim()) {
-        void translateAndBroadcast(newSegment.trim());
+        translateAndBroadcast(newSegment.trim());
       }
     }
 
-    // Reset the tracking ref when the session is restarted (transcript cleared).
     if (!transcript && prev) {
       prevTranscriptRef.current = '';
     }
   }, [transcript, translateAndBroadcast]);
 
-  // Auto-scroll the history list to the top whenever a new item arrives.
   const historyRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (historyRef.current) {
@@ -301,7 +271,6 @@ export default function ControlPage() {
     if (isListening) {
       stopListening();
     } else {
-      // The hook clears the accumulated transcript on each startListening call.
       prevTranscriptRef.current = '';
       startListening();
     }
@@ -327,7 +296,6 @@ export default function ControlPage() {
     sendMessage(msg);
   }, [sendMessage]);
 
-  // ---- Derived state ----
   const connectionColor = isConnected ? '#22c55e' : '#e94560';
   const connectionLabel = isConnected ? 'Connected' : 'Disconnected';
 
@@ -337,7 +305,6 @@ export default function ControlPage() {
 
   return (
     <>
-      {/* Global keyframe animation injected once via a style tag */}
       <style>{`
         @keyframes pulse {
           0%, 100% { opacity: 1; transform: scale(1); }
@@ -378,7 +345,6 @@ export default function ControlPage() {
             borderRight: '1px solid #0f3460',
           }}
         >
-          {/* Logo / title */}
           <div style={{ marginBottom: 24 }}>
             <div
               style={{
@@ -404,7 +370,6 @@ export default function ControlPage() {
             </div>
           </div>
 
-          {/* Nav items (visual only – single page app) */}
           {['Audio', 'Translations', 'Settings'].map((label) => (
             <div
               key={label}
@@ -420,7 +385,6 @@ export default function ControlPage() {
             </div>
           ))}
 
-          {/* Spacer */}
           <div style={{ flex: 1 }} />
 
           {/* Connection badge */}
@@ -450,7 +414,21 @@ export default function ControlPage() {
             </span>
           </div>
 
-          {/* Language badge */}
+          {/* Pipeline badge */}
+          <div
+            style={{
+              padding: '8px 12px',
+              backgroundColor: '#0f3460',
+              borderRadius: 8,
+              fontSize: 11,
+              color: '#22c55e',
+              textAlign: 'center',
+              letterSpacing: '0.04em',
+            }}
+          >
+            STREAMING MODE
+          </div>
+
           <div
             style={{
               padding: '8px 12px',
@@ -479,18 +457,16 @@ export default function ControlPage() {
             maxWidth: 960,
           }}
         >
-          {/* Page header */}
           <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div>
               <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700 }}>
                 Operator Dashboard
               </h1>
               <p style={{ margin: '4px 0 0', fontSize: 13, color: '#7b8ab8' }}>
-                English &rarr; Spanish real-time subtitles
+                English &rarr; Spanish real-time subtitles (streaming)
               </p>
             </div>
 
-            {/* Clear display action – always visible */}
             <button
               onClick={handleClearDisplay}
               disabled={!isConnected}
@@ -555,7 +531,7 @@ export default function ControlPage() {
             </div>
           )}
 
-          {/* ---- Two-column grid ---- */}
+          {/* Two-column grid */}
           <div
             style={{
               display: 'grid',
@@ -563,9 +539,7 @@ export default function ControlPage() {
               gap: 20,
             }}
           >
-            {/* ============================================================
-                AUDIO CONTROL
-            ============================================================ */}
+            {/* AUDIO CONTROL */}
             <Card title="Audio Control" style={{ gridColumn: '1 / -1' }}>
               {!isSpeechSupported && (
                 <p
@@ -584,7 +558,6 @@ export default function ControlPage() {
               )}
 
               <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
-                {/* START / STOP toggle */}
                 <button
                   onClick={handleToggleListening}
                   disabled={!isSpeechSupported}
@@ -619,11 +592,9 @@ export default function ControlPage() {
                   {isListening ? 'STOP' : 'START'}
                 </button>
 
-                {/* Status indicators */}
                 <div
                   style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
                 >
-                  {/* Recording indicator */}
                   <div
                     style={{
                       display: 'flex',
@@ -651,7 +622,6 @@ export default function ControlPage() {
                     {isListening ? 'Listening…' : 'Microphone off'}
                   </div>
 
-                  {/* Translation in-progress */}
                   {isTranslating && (
                     <div
                       style={{
@@ -674,7 +644,7 @@ export default function ControlPage() {
                           flexShrink: 0,
                         }}
                       />
-                      Translating…
+                      Streaming translation…
                     </div>
                   )}
                 </div>
@@ -707,9 +677,7 @@ export default function ControlPage() {
               </div>
             </Card>
 
-            {/* ============================================================
-                TRANSLATION HISTORY
-            ============================================================ */}
+            {/* TRANSLATION HISTORY */}
             <Card title={`Translations (last ${MAX_HISTORY_ITEMS})`}>
               <div
                 ref={historyRef}
@@ -744,14 +712,11 @@ export default function ControlPage() {
               </div>
             </Card>
 
-            {/* ============================================================
-                SETTINGS PANEL
-            ============================================================ */}
+            {/* SETTINGS PANEL */}
             <Card title="Display Settings">
               <div
                 style={{ display: 'flex', flexDirection: 'column', gap: 16 }}
               >
-                {/* Font size */}
                 <SettingRow label={`Font size: ${pendingSettings.fontSize}px`}>
                   <input
                     type="range"
@@ -770,7 +735,6 @@ export default function ControlPage() {
                   />
                 </SettingRow>
 
-                {/* Max lines */}
                 <SettingRow label="Max lines">
                   <select
                     value={pendingSettings.maxLines}
@@ -800,7 +764,6 @@ export default function ControlPage() {
                   </select>
                 </SettingRow>
 
-                {/* Show original */}
                 <SettingRow label="Show original (English)">
                   <ToggleSwitch
                     checked={pendingSettings.showOriginal}
@@ -812,7 +775,6 @@ export default function ControlPage() {
                   />
                 </SettingRow>
 
-                {/* Theme */}
                 <SettingRow label="Display theme">
                   <ToggleSwitch
                     checked={pendingSettings.theme === 'dark'}
@@ -829,7 +791,6 @@ export default function ControlPage() {
                   />
                 </SettingRow>
 
-                {/* Current applied settings summary */}
                 <div
                   style={{
                     fontSize: 12,
@@ -845,7 +806,6 @@ export default function ControlPage() {
                   {settings.theme} theme
                 </div>
 
-                {/* Apply button */}
                 <button
                   onClick={handleApplySettings}
                   disabled={!isConnected}
@@ -904,7 +864,6 @@ function TranslationHistoryItem({ item }: TranslationHistoryItemProps) {
         opacity: item.isFinal ? 1 : 0.75,
       }}
     >
-      {/* Timestamp + status */}
       <div
         style={{
           display: 'flex',
@@ -927,18 +886,16 @@ function TranslationHistoryItem({ item }: TranslationHistoryItemProps) {
               letterSpacing: '0.05em',
             }}
           >
-            PENDING
+            STREAMING
           </span>
         )}
       </div>
 
-      {/* English original */}
       <div style={{ fontSize: 13, color: '#b0b8d8', lineHeight: 1.4 }}>
         <span style={{ color: '#7b8ab8', marginRight: 4 }}>EN</span>
         {item.originalText}
       </div>
 
-      {/* Spanish translation */}
       <div style={{ fontSize: 14, color: '#e8eaf6', lineHeight: 1.4, fontWeight: 500 }}>
         <span style={{ color: '#7b8ab8', marginRight: 4 }}>ES</span>
         {item.translatedText === '[Translation failed]' ? (
